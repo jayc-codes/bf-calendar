@@ -1,33 +1,31 @@
 """Generate the BF trading-calendar .ics, the feed you subscribe to in Google Calendar.
 
-The day classification is a line-for-line mirror of the live gate,
-``bucko-freedom/ninjatrader/BFCalendar.cs`` -> ``NoTradeReason``, in the SAME
-order the C# evaluates it:
+WHICH RULE THIS MIRRORS (2026-11-10). The gate that runs on the box is the v2
+decision seam, `BFEngine.Holiday.cs` `PrepareModelDay` -> `HolidayDrop.Decide`:
 
-    1. no cash open      Columbus Day, Veterans Day
-    2. exchange holiday  NYSE/Nasdaq closures (Good Friday included)
-    3. half session      13:15 ET early close
-    4. beside a closure  weekday one calendar day either side of a closure
-    5. quarterly expiry  <= 4 calendar days to the 3rd Friday of Mar/Jun/Sep/Dec
+    HolidayDrop.Decide(day, IsNoCashOpen, IsCashClosed, IsHalfSession, BesideModel,
+                       DropNoCashOpen, DropPreExpiry)
 
-Any weekday that survives all five is a trading day. Weekends are never sessions.
+The DEPLOYED strategy has both flags FALSE, read back from its own startup config
+line in `C:\\ProgramData\\stage\\bf-v2-report.log`:
 
-WHY THIS REPLACED THE FIRST GENERATOR (2026-11-10). The first one derived days
-from ``marketdata/holidays.py``, which has no Columbus Day / Veterans Day class
-at all -- so it printed ``Trading Window`` on 2026-11-11, while the live gate says
-NO TRADE. The incident is why ``BFCalendar.noCashOpen`` exists (the chart traded
-Columbus Day live while the backtest excluded it). ``tests/test_trading_calendar.py``
-pins the feed to the C# answer so the two cannot drift again.
+    ... coreNoHolidayGate=false ... dropPreExpiry=false dropNoCashOpen=false ...
 
-WHY VETERANS DAY IS HERE AT ALL, and where the C# premise is wrong. ``BFCalendar``
-says these two dates have "no 09:30 cash open". That is false for the NYSE, which
-trades a full session on both Columbus Day and Veterans Day. What ``BFCalendar``
-really encodes is a defensive skip of two thin-ish sessions; ``holidays.py`` never
-excluded them, so the -0.231R "no cash open" figure was measured on real closures
-(MLK, Presidents, Memorial, July 4, Labor, Thanksgiving, Christmas, New Year,
-Good Friday, Juneteenth), not on these two days. The feed mirrors the gate because
-its job is "when does BF trade", not "when is the market open". Flip that decision
-in one place: ``NO_CASH_OPEN_LABELS`` plus ``--holidays market``.
+So the live strategy drops exactly three classes, which are also the FROZEN ORACLE's
+three (`headline.CFG` drop = ("no_cash_open", "half", "beside") where `classify`
+takes no_cash_open from `cash_closed`, a real NYSE closure):
+
+    MODE "live" (default)   closed, half, beside.            <- the box and the oracle
+    MODE "reason"           live + no-cash-open + pre-expiry. <- BFCalendar.NoTradeReason
+
+The two extra classes in `NoTradeReason` (Columbus Day, Veterans Day; and dte<=4 to a
+quarterly expiry) are the OLD C# live rule, kept behind flags the operator has left
+off. MEASURED, they are not worth a filter (bucko-freedom/scripts/columbus_veterans.py,
+on the 1,245 adopted trades): the eleven Columbus/Veterans sessions that produced a
+trade carry THIRTEEN trades, E=+0.002R, day-bootstrap 95% interval [-0.613, +0.749].
+Dropping them moves R/month by -0.00 and the headline ratio by -0.009 (7.29 R/mo,
+0.965 against 0.956): no gain, and it is inside the random-session band (p=0.078 on
+the matched null, R removed +0.02 against a random-eleven median of +7.92).
 
     python scripts/calendar/trading_calendar.py --out scripts/calendar/trading-calendar.ics
     python scripts/calendar/trading_calendar.py --selftest
@@ -48,6 +46,7 @@ CAL_DESC = ("When the BF strategy trades. Trading days carry the 09:30-10:30 ET 
             "description.")
 HORIZON_BACK_DAYS = 90
 FIRST_YEAR, LAST_YEAR = 2015, 2060
+MODES = ("live", "reason")
 
 
 # ---------------------------------------------------------------- calendar math
@@ -105,7 +104,7 @@ def closures(y: int) -> dict[date, str]:
 
 
 def no_cash_open(y: int) -> dict[date, str]:
-    """The C# BuildNoCashOpen set: futures trade, the gate stands down anyway."""
+    """The C# BuildNoCashOpen set: futures trade, the old rule stood down anyway."""
     return {
         nth_weekday(y, 10, 0, 2): "Columbus Day",
         observed(date(y, 11, 11)): "Veterans Day",
@@ -142,27 +141,28 @@ def quarterly_month(day: date) -> str:
 
 
 class Calendar:
-    """The five gates, in the C# order. ``None`` from ``no_trade`` means tradeable."""
+    """The live decision, or the old NoTradeReason, over a span of years."""
 
-    def __init__(self, years: range, include_expiry: bool = True, holidays: str = "bf"):
-        self.include_expiry = include_expiry
+    def __init__(self, years: range, mode: str = "live"):
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}: {mode!r}")
+        self.mode = mode
         self.closed: dict[date, str] = {}
         self.nocash: dict[date, str] = {}
         self.half: dict[date, str] = {}
         for y in years:
             self.closed.update(closures(y))
-            if holidays == "bf":
-                self.nocash.update(no_cash_open(y))
+            self.nocash.update(no_cash_open(y))
             self.half.update(half_sessions(y))
 
     def no_trade(self, d: date) -> tuple[str, str] | None:
-        """(short title, long reason) or None. Mirrors BFCalendar.NoTradeReason."""
-        if d in self.nocash:
+        """(short title, long reason) or None. Mirrors HolidayDrop.Decide in "live"."""
+        if self.mode == "reason" and d in self.nocash:
             name = self.nocash[d]
             return (f"No trade - {name}",
-                    f"{name}: BFCalendar treats this as a no-cash-open day and stands "
-                    f"down. Note the NYSE is actually open; this is a defensive skip, "
-                    f"not a closure.")
+                    f"{name}: the old C# rule treated this as a no-cash-open day. The "
+                    f"NYSE is actually open on {name}; the deployed strategy keeps the "
+                    f"session, so this marker only appears in reason mode.")
         if d in self.closed:
             name = self.closed[d]
             return (f"No trade - {name}",
@@ -179,7 +179,7 @@ class Calendar:
                 return (f"No trade - beside {self.closed[cand]}",
                         f"Beside a closure ({direction} {self.closed[cand]}). Thin, "
                         f"excluded from the backtest.")
-        if self.include_expiry:
+        if self.mode == "reason":
             dte = days_to_quarterly_expiry(d)
             if dte <= 4:
                 when = "today" if dte == 0 else f"{dte} day{'s' if dte != 1 else ''} out"
@@ -187,16 +187,16 @@ class Calendar:
                         if dte else "No trade - quarterly expiry day",
                         f"Front-month volume runs 22-28% of normal at 2-4 days out and "
                         f"1-2% on expiry day ({quarterly_month(d)} expiry is {when}). "
-                        f"Roll to the next contract and resume.")
+                        f"The deployed strategy keeps this session; marker is reason-mode only.")
         return None
 
 
 # ------------------------------------------------------------------- ics writing
 def esc(text: str) -> str:
     """RFC 5545 TEXT escaping: backslash, semicolon, comma, newline."""
-    out = (text.replace("\\", "\\\\").replace(";", "\\;")
-               .replace(",", "\\,").replace("\r\n", "\\n").replace("\n", "\\n"))
-    return out.replace("\r", "\\n")
+    return (text.replace("\\", "\\\\").replace(";", "\\;")
+                .replace(",", "\\,").replace("\r\n", "\\n").replace("\n", "\\n")
+                .replace("\r", "\\n"))
 
 
 def fold(line: str) -> str:
@@ -236,10 +236,9 @@ END:STANDARD
 END:VTIMEZONE""".split("\n")
 
 
-def build(start: date, end: date, include_expiry: bool = True,
-          holidays: str = "bf", stamp: datetime | None = None) -> tuple[str, int, int]:
-    years = range(start.year - 1, end.year + 2)
-    cal = Calendar(years, include_expiry=include_expiry, holidays=holidays)
+def build(start: date, end: date, mode: str = "live",
+          stamp: datetime | None = None) -> tuple[str, int, int]:
+    cal = Calendar(range(start.year - 1, end.year + 2), mode)
     # DTSTAMP is derived from the window, not from the clock: a daily refresh then
     # produces byte-identical output, so the feed only commits when its CONTENT
     # changes. Google refetches on its own schedule regardless of DTSTAMP.
@@ -287,64 +286,61 @@ def build(start: date, end: date, include_expiry: bool = True,
 
 
 def default_window(today: date | None = None) -> tuple[date, date]:
-    """A window that only moves once a month, so a daily refresh commits only then.
-
-    Start is the 1st of the month 90 days back; end is 31 Dec two years out. The
-    horizon is therefore always >= 90 days behind and >= 2 years ahead, and the
-    generated bytes are identical for every day inside the same month.
-    """
+    """A window that only moves once a month, so a daily refresh commits only then."""
     today = today or date.today()
     back = today - timedelta(days=HORIZON_BACK_DAYS)
     return date(back.year, back.month, 1), date(today.year + 2, 12, 31)
 
 
 # --------------------------------------------------------------------- selftest
+# Golden sets dumped from the COMPILED C#: BFCalendar.cs + HolidayDrop.cs, driven the
+# way BFEngine.Holiday.cs drives them with the DEPLOYED flags (false/false). Any drift
+# between this feed and the box shows up here.
 GOLDEN_TRADE = """
-2026-11-06 2026-11-09 2026-11-10 2026-11-12 2026-11-13 2026-11-16 2026-11-17
-2026-11-18 2026-11-19 2026-11-20 2026-11-23 2026-11-24 2026-11-30 2026-12-01
-2026-12-02 2026-12-03 2026-12-04 2026-12-07 2026-12-08 2026-12-09 2026-12-10
-2026-12-11 2026-12-21 2026-12-22 2026-12-23 2026-12-28 2026-12-29 2026-12-30
-2027-01-04 2027-01-05 2027-01-06 2027-01-07 2027-01-08 2027-01-11 2027-01-12
-2027-01-13 2027-01-14 2027-01-15 2027-01-20 2027-01-21 2027-01-22 2027-01-25
-2027-01-26 2027-01-27 2027-01-28 2027-01-29 2027-02-01 2027-02-02 2027-02-03
-2027-02-04
+2026-11-06 2026-11-09 2026-11-10 2026-11-11 2026-11-12 2026-11-13
+2026-11-16 2026-11-17 2026-11-18 2026-11-19 2026-11-20 2026-11-23
+2026-11-24 2026-11-30 2026-12-01 2026-12-02 2026-12-03 2026-12-04
+2026-12-07 2026-12-08 2026-12-09 2026-12-10 2026-12-11 2026-12-14
+2026-12-15 2026-12-16 2026-12-17 2026-12-18 2026-12-21 2026-12-22
+2026-12-23 2026-12-28 2026-12-29 2026-12-30 2027-01-04 2027-01-05
+2027-01-06 2027-01-07 2027-01-08 2027-01-11 2027-01-12 2027-01-13
+2027-01-14 2027-01-15 2027-01-20 2027-01-21 2027-01-22 2027-01-25
+2027-01-26 2027-01-27 2027-01-28 2027-01-29 2027-02-01 2027-02-02
+2027-02-03 2027-02-04
 """
 GOLDEN_SKIP = """
-2026-11-11 2026-11-25 2026-11-26 2026-11-27 2026-12-14 2026-12-15 2026-12-16
-2026-12-17 2026-12-18 2026-12-24 2026-12-25 2026-12-31 2027-01-01 2027-01-18
-2027-01-19
+2026-11-25 2026-11-26 2026-11-27 2026-12-24 2026-12-25 2026-12-31
+2027-01-01 2027-01-18 2027-01-19
 """
 
 
 def selftest() -> int:
-    """Pin the gate to the answer the compiled BFCalendar.cs gives (see README)."""
+    """Pin the feed to the compiled C# decision the box runs."""
     start, end = date(2026, 11, 6), date(2027, 2, 4)
-    cal = Calendar(range(start.year - 1, end.year + 2))
+    cal = Calendar(range(start.year - 1, end.year + 2), "live")
     got_trade, got_skip = [], []
     d = start
     while d <= end:
         if d.weekday() < 5:
             (got_skip if cal.no_trade(d) else got_trade).append(d.isoformat())
         d += timedelta(days=1)
-    want_trade = GOLDEN_TRADE.split()
-    want_skip = GOLDEN_SKIP.split()
     fails = []
-    if got_trade != want_trade:
-        fails.append(f"trading days differ\n  got  {got_trade}\n  want {want_trade}")
-    if got_skip != want_skip:
-        fails.append(f"skipped days differ\n  got  {got_skip}\n  want {want_skip}")
+    if got_trade != GOLDEN_TRADE.split():
+        fails.append(f"trading days differ\n  got  {got_trade}\n  want {GOLDEN_TRADE.split()}")
+    if got_skip != GOLDEN_SKIP.split():
+        fails.append(f"skipped days differ\n  got  {got_skip}\n  want {GOLDEN_SKIP.split()}")
 
-    # The 2026-11-10 regression: the first feed called Veterans Day tradeable.
-    if (date(2026, 11, 11) in {date.fromisoformat(x) for x in got_trade}):
-        fails.append("2026-11-11 (Veterans Day) came back tradeable")
-    # Columbus Day and the expiry week, the other two classes the old feed missed.
-    for pin in (date(2026, 10, 12), date(2026, 12, 18), date(2026, 11, 27)):
-        if cal.no_trade(pin) is None:
-            fails.append(f"{pin} came back tradeable")
-    # A plain week must stay contiguous: Mon-Fri tradeable, weekend absent.
-    for pin in (date(2027, 1, 4), date(2027, 1, 8)):
+    # The two classes the deployed flags turn off: live KEEPS them, reason DROPS them.
+    reason = Calendar(range(2025, 2029), "reason")
+    for pin in (date(2026, 11, 11), date(2026, 10, 12), date(2026, 12, 18)):
         if cal.no_trade(pin) is not None:
-            fails.append(f"{pin} came back skipped")
+            fails.append(f"{pin} skipped in live mode; the deployed flags keep it")
+        if reason.no_trade(pin) is None:
+            fails.append(f"{pin} kept in reason mode; BFCalendar.NoTradeReason drops it")
+    # ...and the model's own three classes must drop in BOTH modes.
+    for pin in (date(2026, 11, 26), date(2026, 11, 27), date(2026, 11, 25)):
+        if cal.no_trade(pin) is None or reason.no_trade(pin) is None:
+            fails.append(f"{pin} must be skipped in both modes")
 
     for f in fails:
         print("FAIL", f)
@@ -358,11 +354,10 @@ def main() -> int:
     p.add_argument("--from", dest="start", default=None)
     p.add_argument("--to", dest="end", default=None)
     p.add_argument("--out", default="scripts/calendar/trading-calendar.ics")
-    p.add_argument("--no-expiry", action="store_true",
-                   help="skip the quarterly-expiry blackout")
-    p.add_argument("--holidays", choices=("bf", "market"), default="bf",
-                   help="bf: mirror the BFCalendar gate (default). market: NYSE-only "
-                        "closures, dropping the Columbus/Veterans defensive skip.")
+    p.add_argument("--mode", choices=MODES, default="live",
+                   help="live: the deployed decision (closures, half, beside). "
+                        "reason: BFCalendar.NoTradeReason, which also drops Columbus/Veterans "
+                        "and the expiry week (the flags the box has off).")
     p.add_argument("--selftest", action="store_true")
     a = p.parse_args()
 
@@ -375,13 +370,13 @@ def main() -> int:
     if a.end:
         end = datetime.strptime(a.end, "%Y-%m-%d").date()
 
-    ics, trade, no = build(start, end, not a.no_expiry, a.holidays)
+    ics, trade, no = build(start, end, a.mode)
     out = Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(ics, encoding="utf-8", newline="")
     print(f"{out}: {trade + no} weekdays ({trade} Trading Window, {no} No trade)")
     print(f"  {start} .. {end}, {WIN_START[0]:02d}:{WIN_START[1]:02d}-"
-          f"{WIN_END[0]:02d}:{WIN_END[1]:02d} {TZID}, holidays={a.holidays}")
+          f"{WIN_END[0]:02d}:{WIN_END[1]:02d} {TZID}, mode={a.mode}")
     return 0
 
 
