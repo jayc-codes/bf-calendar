@@ -1,0 +1,57 @@
+name: refresh
+
+on:
+  schedule:
+    # 09:17 UTC daily. Offset off the hour: the Actions cron queue is busiest at :00.
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Self-test the gate against the pinned C# answer
+        run: python trading_calendar.py --selftest
+
+      - name: Regenerate the feed
+        run: python trading_calendar.py --out trading-calendar.ics
+
+      - name: Fail if the file is not valid iCalendar
+        run: |
+          python - <<'PY'
+          raw = open("trading-calendar.ics", "rb").read()
+          assert raw.startswith(b"BEGIN:VCALENDAR\r\n"), "missing VCALENDAR header"
+          assert raw.endswith(b"END:VCALENDAR\r\n"), "missing VCALENDAR footer"
+          assert raw.count(b"BEGIN:VEVENT") == raw.count(b"END:VEVENT"), "unbalanced VEVENT"
+          assert b"\n" not in raw.replace(b"\r\n", b""), "bare LF: RFC 5545 wants CRLF"
+          assert raw.count(b"BEGIN:VEVENT") > 0, "no events"
+          for line in raw.split(b"\r\n"):
+              if line:
+                  assert len(line) <= 75, "line over 75 octets: " + line[:40].decode()
+          print("structure ok:", raw.count(b"BEGIN:VEVENT"), "events")
+          PY
+
+      - name: Commit if the content changed
+        run: |
+          if git diff --quiet -- trading-calendar.ics; then
+            echo "no change"
+          else
+            git config user.name "bf-calendar-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add trading-calendar.ics
+            git commit -m "refresh: $(date -u +%Y-%m-%d)"
+            git push
+          fi
